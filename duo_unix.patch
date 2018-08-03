@@ -1,0 +1,211 @@
+diff --git a/lib/util.c b/lib/util.c
+index 73fcbb4..8ad0fcd 100644
+--- a/lib/util.c
++++ b/lib/util.c
+@@ -31,6 +31,9 @@ duo_config_default(struct duo_config *cfg)
+     cfg->local_ip_fallback = 0;
+     cfg->https_timeout = -1;
+     cfg->fips_mode = 0;
++    cfg->gecos_parsed = 0;
++    cfg->gecos_delim = '/';
++    cfg->gecos_fieldnum = 5;
+ }
+ 
+ int
+@@ -115,6 +118,21 @@ duo_common_ini_handler(struct duo_config *cfg, const char *section,
+         cfg->send_gecos = duo_set_boolean_option(val);
+     } else if (strcmp(name, "gecos_parsed") == 0) {
+         cfg->gecos_parsed = duo_set_boolean_option(val);
++    } else if (strcmp(name, "gecos_delim") == 0) {
++        /* Grab first character, use as delimiter */
++        if (strlen(val) > 1) {
++            fprintf(stderr, "Multibyte GECOS field delimiter detected: '%s'\n", val);
++        }
++        cfg->gecos_delim = *val;
++    } else if (strcmp(name, "gecos_fieldnum") == 0) {
++        cfg->gecos_fieldnum = atoi(val);
++        /* Adjust GECOS field from human counting to program counting */
++        cfg->gecos_fieldnum -= 1;
++        /* Clamp values to valid GECOS field range */
++        if (cfg->gecos_fieldnum < 0 || cfg->gecos_fieldnum > MAX_GECOS_FIELDS) {
++            fprintf(stderr, "GECOS field number out of range: '%s'\n", val);
++            cfg->gecos_fieldnum = 1; /* Take first field if out of range */
++        }
+     } else if (strcmp(name, "dev_fips_mode") == 0) {
+         /* This flag is for development */
+         cfg->fips_mode = duo_set_boolean_option(val);
+diff --git a/lib/util.h b/lib/util.h
+index f60c708..b2a0af2 100644
+--- a/lib/util.h
++++ b/lib/util.h
+@@ -11,6 +11,16 @@
+ #define MAX_GROUPS 256
+ #define MAX_PROMPTS 3
+ 
++#define MAX_GECOS_FIELDS 122 // Maximum possible number of GECOS fields
++/*
++ * Reasoning: GECOS_MAX length is 127 characters. Assume all fields except
++ * a minimal length email address (3 characters) are empty (i.e. all commas).
++ * That leaves 123 commas minus a null terminator. Adjusting for human counting
++ * tendencies, that leaves 123 possible fields ranging from indicies 0 to 122.
++ *
++ * Reference: https://www.qualys.com/2015/07/23/cve-2015-3245-cve-2015-3246/cve-2015-3245-cve-2015-3246.txt
++ */
++
+ #include <pwd.h>
+ #include <syslog.h>
+ #include <stdarg.h>
+@@ -42,6 +52,8 @@ struct duo_config {
+     int  https_timeout;
+     int  send_gecos;
+     int  gecos_parsed;
++    char gecos_delim;
++    int  gecos_fieldnum;
+     int  fips_mode;
+ };
+ 
+diff --git a/login_duo/login_duo.8 b/login_duo/login_duo.8
+index 5730df3..5635f38 100644
+--- a/login_duo/login_duo.8
++++ b/login_duo/login_duo.8
+@@ -77,6 +77,17 @@ Send command to be approved via Duo Push authentication. Default is
+ .It Cm http_proxy
+ Use the specified HTTP proxy, same format as the HTTP_PROXY environment
+ variable.
++.It Cm send_gecos
++Instead of using the unix username, send Duo the contents of the GECOS field
++from /etc/passwd.  Default is "no".
++.It Cm gecos_parsed
++Enables parsing of the GECOS field by a delimiter. Default is "no".
++.It Cm gecos_delim
++Set the delimiter by which to parse the GECOS field. Has no effect if gecos_parsed
++is not set. Default is '/'.
++.It Cm gecos_fieldnum
++Sets which field to select from a parsed GECOS field for sending to Duo. Has no
++effect if gecos_parsed is not set. Default is 5.
+ .It Cm autopush
+ Upon successful first-factor authentication, automatically send a login request to the primary second-factor (usually Duo Push). Can be
+ .Dq Li yes
+diff --git a/login_duo/login_duo.c b/login_duo/login_duo.c
+index ddf4bc2..0ad1459 100644
+--- a/login_duo/login_duo.c
++++ b/login_duo/login_duo.c
+@@ -133,9 +133,17 @@ do_auth(struct login_ctx *ctx, const char *cmd)
+      * Handle a delimited GECOS field. E.g.
+      *
+      *     username:x:0:0:code1/code2/code3//textField/usergecosparsed:/username:/bin/bash
++     * [OR]
++     *     username:x:0:0:Full Name,Office Number,Office Phone,Home Phone/More Data,usergecosparsed:/username:/bin/bash
+      *
+      * Parse the username from the appropriate position in the GECOS field.
+      */
++    /* 
++     * Delimiters and GECOS field position now set in
++     * cfg.gecos_delim and cfg.gecos_fieldnum respectively.
++     * Default cfg.gecos_delim = '/'
++     * Default cfg.gecos_fieldnum = '5'
++     */
+     const char delimiter = '/';
+     const unsigned int delimited_position = 5;
+ 
+@@ -219,7 +227,7 @@ do_auth(struct login_ctx *ctx, const char *cmd)
+     if ((cfg.send_gecos || cfg.gecos_parsed) && !ctx->duouser) {
+         if (strlen(pw->pw_gecos) > 0) {
+             if (cfg.gecos_parsed) {
+-                duouser = duo_split_at(pw->pw_gecos, delimiter, delimited_position);
++                duouser = duo_split_at(pw->pw_gecos, cfg.gecos_delim, cfg.gecos_fieldnum);
+                 if (duouser == NULL || (strcmp(duouser, "") == 0)) {
+                     duo_log(LOG_DEBUG, "Could not parse GECOS field", pw->pw_name, NULL, NULL);
+                     duouser = pw->pw_name;
+diff --git a/login_duo/login_duo.conf b/login_duo/login_duo.conf
+index f886ce8..0efd48a 100644
+--- a/login_duo/login_duo.conf
++++ b/login_duo/login_duo.conf
+@@ -1,4 +1,3 @@
+-
+ [duo]
+ ; Duo integration key
+ ikey = 
+@@ -13,3 +12,10 @@ host =
+ failmode = safe
+ ; Send command for Duo Push authentication
+ ;pushinfo = yes
++
++; This allows parsing of GECOS field for Duo username instead of using the system username.
++;gecos_parsed = yes
++; Use these options to specify a custom delimiter and GECOS field number (first character used):
++; Default delimiter: /    Default field number: 5
++;gecos_delim = /
++;gecos_fieldnum = 5
+diff --git a/pam_duo/pam_duo.8 b/pam_duo/pam_duo.8
+index 31e956a..8de586f 100644
+--- a/pam_duo/pam_duo.8
++++ b/pam_duo/pam_duo.8
+@@ -66,6 +66,14 @@ IP. Default is "no".
+ .It Cm send_gecos
+ Instead of using the unix username, send Duo the contents of the GECOS field
+ from /etc/passwd.  Default is "no".
++.It Cm gecos_parsed
++Enables parsing of the GECOS field by a delimiter. Default is "no".
++.It Cm gecos_delim
++Set the delimiter by which to parse the GECOS field. Has no effect if gecos_parsed
++is not set. Default is '/'.
++.It Cm gecos_fieldnum
++Sets which field to select from a parsed GECOS field for sending to Duo. Has no
++effect if gecos_parsed is not set. Default is 5.
+ .El
+ .Pp
+ An example configuration file:
+diff --git a/pam_duo/pam_duo.c b/pam_duo/pam_duo.c
+index 72e35ab..5a2fb49 100644
+--- a/pam_duo/pam_duo.c
++++ b/pam_duo/pam_duo.c
+@@ -129,11 +129,17 @@ pam_sm_authenticate(pam_handle_t *pamh, int pam_flags,
+ 	 * Handle a delimited GECOS field. E.g.
+ 	 *
+ 	 *     username:x:0:0:code1/code2/code3//textField/usergecosparsed:/username:/bin/bash
++	 * [OR]
++	 *     username:x:0:0:Full Name,Office Number,Office Phone,Home Phone/More Data,usergecosparsed:/username:/bin/bash
+ 	 *
+ 	 * Parse the username from the appropriate position in the GECOS field.
+ 	 */
+-	const char delimiter = '/';
+-	const unsigned int delimited_position = 5;
++	/* 
++	 * Delimiters and GECOS field position now set in
++	 * cfg.gecos_delim and cfg.gecos_fieldnum respectively.
++	 * Default cfg.gecos_delim = '/'
++	 * Default cfg.gecos_fieldnum = '5'
++	 */
+ 
+ 	duo_config_default(&cfg);
+ 
+@@ -237,7 +243,7 @@ pam_sm_authenticate(pam_handle_t *pamh, int pam_flags,
+     if (cfg.send_gecos || cfg.gecos_parsed) {
+         if (strlen(pw->pw_gecos) > 0) {
+             if (cfg.gecos_parsed) {
+-                user = duo_split_at(pw->pw_gecos, delimiter, delimited_position);
++                user = duo_split_at(pw->pw_gecos, cfg.gecos_delim, cfg.gecos_fieldnum);
+                 if (user == NULL || (strcmp(user, "") == 0)) {
+                     duo_log(LOG_DEBUG, "Could not parse GECOS field", pw->pw_name, NULL, NULL);
+                     user = pw->pw_name;
+diff --git a/pam_duo/pam_duo.conf b/pam_duo/pam_duo.conf
+index f886ce8..0efd48a 100644
+--- a/pam_duo/pam_duo.conf
++++ b/pam_duo/pam_duo.conf
+@@ -1,4 +1,3 @@
+-
+ [duo]
+ ; Duo integration key
+ ikey = 
+@@ -13,3 +12,10 @@ host =
+ failmode = safe
+ ; Send command for Duo Push authentication
+ ;pushinfo = yes
++
++; This allows parsing of GECOS field for Duo username instead of using the system username.
++;gecos_parsed = yes
++; Use these options to specify a custom delimiter and GECOS field number (first character used):
++; Default delimiter: /    Default field number: 5
++;gecos_delim = /
++;gecos_fieldnum = 5
